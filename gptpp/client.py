@@ -1,107 +1,79 @@
 import json
-import httpx
+import uuid
+from curl_cffi import requests
 
-class GPTClient:
-    def __init__(self, session_token: str, url: str):
-        self.session_token = session_token
-        self.url = url
+class ChatGPTBrokerClient:
+    def __init__(self):
+        self.client = requests.Session(impersonate="chrome")
+        self.load_fresh_tokens()
 
-        self.session = httpx.AsyncClient(
-            headers={
-                "Authorization": f"Bearer {session_token}",
-                "Content-Type": "application/json"
+    def load_fresh_tokens(self):
+        try:
+            with open("session.json", "r") as f:
+                data = json.load(f)
+            
+            # Map dynamic browser identities directly into your raw Python client headers
+            self.headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/event-stream",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://chatgpt.com/",
+                "Content-Type": "application/json",
+                "X-OpenAI-Target-Path": "/backend-api/f/conversation",
+                "X-OpenAI-Target-Route": "/backend-api/f/conversation",
+                "OAI-Device-Id": data.get("device-id", str(uuid.uuid4())),
+                "OAI-Session-Id": data.get("session-id", str(uuid.uuid4())),
+                "OAI-Client-Version": data.get("client-version", "prod-41183dd6bcf6c4453798fd7d7cebafa88e930320"),
+                "OpenAI-Sentinel-Chat-Requirements-Token": data.get("chat-requirements-token", ""),
+                "OpenAI-Sentinel-Proof-Token": data.get("proof-token", ""),
+                "x-conduit-token": data.get("x-conduit-token", ""),
+                "Cookie": data.get("cookie_string", ""),
+                "Origin": "https://chatgpt.com",
+                "Connection": "keep-alive"
             }
-        )
+        except FileNotFoundError:
+            raise Exception("No active session database found. Run browser.py token broker first.")
 
-        self.conversation_id = None
-        self.parent_message_id = None
-
-    async def send(self, prompt: str, debug_raw: bool = True):
+    def stream_chat(self, prompt):
+        # Refresh configuration keys right before making the stream execution pass
+        self.load_fresh_tokens()
+        
+        url = "https://chatgpt.com/backend-anon/f/conversation"
         payload = {
             "action": "next",
-            "messages": [{
-                "id": None,
-                "author": {"role": "user"},
-                "content": {
-                    "content_type": "text",
-                    "parts": [prompt]
+            "messages": [
+                {
+                    "id": str(uuid.uuid4()),
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": [prompt]},
+                    "metadata": {}
                 }
-            }],
-            "conversation_id": self.conversation_id,
-            "parent_message_id": self.parent_message_id,
-            "model": "auto"
+            ],
+            "parent_message_id": str(uuid.uuid4()),
+            "model": "auto",
+            "client_prepare_state": "success",
+            "timezone_offset_min": -330,
+            "history_and_training_disabled": True
         }
 
-        async with self.session.stream("POST", self.url, json=payload) as r:
+        response = self.client.post(url, headers=self.headers, json=payload, stream=True)
+        
+        if response.status_code != 200:
+            yield f"\n[Session Expired] Status {response.status_code}. Refreshing broker mandatory."
+            return
 
-            full_text = ""
-            last_msg_id = None
-
-            async for line in r.aiter_lines():
-
-                # 🔴 RAW STREAM (your debug request)
-                if debug_raw:
-                    print(line)
-
-                if not line:
-                    continue
-
-                if not line.startswith("data:"):
-                    continue
-
-                data = line[5:].strip()
-
-                if data == "[DONE]":
+        for line in response.iter_lines():
+            if not line:
+                continue
+            line_decoded = line.decode('utf-8')
+            if line_decoded.startswith("data: "):
+                data_str = line_decoded[6:]
+                if data_str.strip() == "[DONE]":
                     break
-
                 try:
-                    obj = json.loads(data)
+                    data_json = json.loads(data_str)
+                    parts = data_json["message"]["content"]["parts"]
+                    if parts:
+                        yield parts[0]
                 except:
-                    continue
-
-                # 🔍 parsed debug
-                if debug_raw:
-                    print("PARSED:", obj)
-
-                # -------------------------
-                # 🧠 update conversation state
-                # -------------------------
-                if "conversation_id" in obj:
-                    self.conversation_id = obj["conversation_id"]
-
-                if "message" in obj and isinstance(obj["message"], dict):
-                    last_msg_id = obj["message"].get("id")
-
-                # -------------------------
-                # 🧠 extract text safely
-                # -------------------------
-                text = ""
-
-                msg = obj.get("message")
-                if isinstance(msg, dict):
-                    content = msg.get("content")
-
-                    if isinstance(content, dict):
-                        parts = content.get("parts")
-
-                        if isinstance(parts, list):
-                            text = "".join(parts)
-
-                        elif "text" in content:
-                            text = content["text"]
-
-                # fallback formats
-                if not text:
-                    text = obj.get("delta") or obj.get("text") or ""
-
-                if text:
-                    print(text, end="", flush=True)
-                    full_text += text
-
-            print()
-
-            # 🔁 update parent_message_id for next turn
-            if last_msg_id:
-                self.parent_message_id = last_msg_id
-
-            return full_text
+                    pass
